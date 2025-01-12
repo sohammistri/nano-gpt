@@ -174,3 +174,5 @@ cython_debug/
 minbpe/train/
 minbpe/test/
 minbpe/models/
+*/wandb
+*/checkpoint
