@@ -176,4 +176,5 @@ minbpe/test/
 minbpe/models/
 */wandb
 */checkpoint
-*.tar.gz*.pt
+*.tar.gz
+*.pt
