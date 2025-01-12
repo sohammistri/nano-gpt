@@ -16,19 +16,19 @@ import os
 
 # ==== CONFIG ====
 CONFIG = {
-    "batch_size": 64,
-    "block_size": 8,
+    "batch_size": 128,
+    "block_size": 256,
     "device": torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'),
-    "emb_dim": 32,
-    "n_heads": 4,
-    "head_dim": 8,
-    "n_layers": 1,
-    "dropout":0.0,
-    "n_iters": 5000,
-    "warmup_iters": 500,
-    "lr_decay_iters": 5000,
-    "learning_rate": 3e-4, # max lr
-    "min_lr": 3e-5, # min lr,
+    "emb_dim": 384,
+    "n_heads": 6,
+    "head_dim": 64,
+    "n_layers": 6,
+    "dropout":0.2,
+    "n_iters": 4000,
+    "warmup_iters": 200,
+    "lr_decay_iters": 4000,
+    "learning_rate": 5e-5, # max lr
+    "min_lr": 5e-6, # min lr,
     "tokenizer_model": "gpt-2",
     "split_ratio": 0.8,
     "checkpoint_dir": "./checkpoint/",
@@ -297,7 +297,7 @@ def get_lr_multiplier(it):
 # Wandb init
 wandb.init(
     # set the wandb project where this run will be logged
-    project="nano-gpt-token-small",
+    project="nano-gpt-token-tiny-shakespeare-large",
     # track hyperparameters and run metadata
     config=CONFIG
 )
