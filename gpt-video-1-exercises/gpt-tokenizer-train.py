@@ -2,52 +2,20 @@
 
 # import libs
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
-import torch.nn.functional as F
 from IPython.display import display, Markdown
 import tiktoken
 import wandb
 import math
-import inspect
-from typing import Any, Callable
 import os
+from .model import NanoGPT
+from .utils import load_config, call_with_matching_args, get_batch, compute_loss
 
 # ==== CONFIG ====
-CONFIG = {
-    "batch_size": 128,
-    "block_size": 256,
-    "device": torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'),
-    "emb_dim": 384,
-    "n_heads": 6,
-    "head_dim": 64,
-    "n_layers": 6,
-    "dropout":0.2,
-    "n_iters": 4000,
-    "warmup_iters": 200,
-    "lr_decay_iters": 4000,
-    "learning_rate": 5e-5, # max lr
-    "min_lr": 5e-6, # min lr,
-    "tokenizer_model": "gpt-2",
-    "split_ratio": 0.8,
-    "checkpoint_dir": "./checkpoint/",
-    "always_save_checkpoint": False
-}
+CONFIG = load_config(config_path="config.yml")
 
 # Helper functions
-
-def call_with_matching_args(func: Callable, data_dict: dict) -> Any:
-    """
-    Call a function or method with only the arguments it accepts from a dictionary.
-    Works with both regular functions and class methods.
-    """
-    params = inspect.signature(func).parameters
-    # Remove 'self' parameter if it's a method
-    if 'self' in params:
-        params = dict(list(params.items())[1:])
-    filtered_args = {k: data_dict[k] for k in params if k in data_dict}
-    return func(**filtered_args)
 
 def get_data(data_path, tokenizer_model="gpt-2", split_ratio=0.8):
     # get the raw tiny shakespeare dataset and split into train and val sets
@@ -64,25 +32,6 @@ def get_data(data_path, tokenizer_model="gpt-2", split_ratio=0.8):
     val_tokens = tokens[split_idx:]
 
     return train_tokens, val_tokens
-
-def get_batch(tokens, block_size, batch_size):
-    batch = torch.randint(0, len(tokens)-block_size, (batch_size,)) # B dimension array of random indices
-    Xb = torch.stack([torch.LongTensor(tokens[i:i+block_size]) for i in batch], dim=0) # Create (B, T) dimension array
-    yb = torch.stack([torch.LongTensor(tokens[i+1:i+block_size+1]) for i in batch], dim=0) # Create (B, T) dimension array
-    return Xb, yb
-
-@torch.no_grad()
-def compute_loss(tokens, block_size, batch_size, model, device):
-    loss_values = []
-    for _ in range(100):
-        Xb, yb = get_batch(tokens, block_size, batch_size)
-        Xb, yb = Xb.to(device), yb.to(device)
-
-        _, loss = model(Xb, yb)
-        loss_values.append(loss.item())
-
-    mean_loss = torch.FloatTensor(loss_values).mean().item()
-    return mean_loss
 
 def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_size, batch_size, n_iters, eval_interval, out_dir, always_save_checkpoint):
     # train_lossi, val_lossi = [], []
@@ -106,7 +55,8 @@ def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_s
         optimizer.step()
 
         # scheduler step
-        scheduler.step()
+        if scheduler:
+            scheduler.step()
 
         wandb.log({"learning_rate": scheduler.get_last_lr()[0]})
 
@@ -134,151 +84,8 @@ def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_s
             wandb.log({"train_loss": train_loss, "val_loss": val_loss})
         # break
 
+
 # Model classes
-class MHA(nn.Module):
-    def __init__(self, emb_dim, block_size, n_heads, head_dim, dropout):
-        super().__init__()
-
-        self.n_heads = n_heads
-        self.head_dim = head_dim
-
-        # 1st LayerNorm
-        self.ln1 = nn.LayerNorm(emb_dim)
-
-        # first Linear to get from emb_dim --> 3 * n_heads*head_dim, to get k,q,v, then proj back to emb_dim
-        self.c_proj = nn.Linear(emb_dim, 3 * n_heads * head_dim, bias=False)
-        self.proj = nn.Linear(n_heads * head_dim, emb_dim)
-
-        # 2nd LayerNorm
-        self.ln2 = nn.LayerNorm(emb_dim)
-
-        # finally thinking layer
-        self.ffn = nn.Sequential(
-            nn.Linear(emb_dim, 4 * emb_dim),
-            nn.ReLU(),
-            nn.Linear(4 * emb_dim, emb_dim)
-        )
-
-        self.attn_dropout = nn.Dropout(dropout)
-        self.proj_dropout = nn.Dropout(dropout)
-        self.think_dropout = nn.Dropout(dropout)
-
-        # finally register the tril matrix
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
-
-    def forward(self, x):
-        # get the shape
-        B, T, C = x.shape
-
-        # Layer norm
-        ln_x = self.ln1(x)
-
-        # Project and extract k,q,v
-        c = self.c_proj(ln_x) # (B,T,C)  --> (B,T,3*nh*H)
-        c = c.view(B, T, self.n_heads, 3 * self.head_dim) # (B,T,nh,3*H)
-        k, q, v = torch.split(c, self.head_dim, dim=-1) # each of shape B,T,nh,H
-        k, q, v = k.transpose(-3, -2), q.transpose(-3, -2), v.transpose(-3, -2) # B, nh, T, H
-
-        # Get the attention weights
-        wei = q @ k.transpose(-2, -1) * (self.head_dim**-0.50) # (B,nh,T,H) @ (B,nh,H,T) -> (B,nh,T,T)
-        wei = wei.masked_fill(self.mask[:, :, :T, :T] == 0, -float("inf"))
-        wei = torch.softmax(wei, dim=-1)
-        wei = self.attn_dropout(wei)
-
-        # Apply to v
-        act = wei @ v # (B,nh,T,T) @ (B,nh,T,H) -> (B,nh,T,H)
-        act = act.transpose(-3, -2) # B,T,nh,H
-        act = act.contiguous().view(B, T, self.n_heads * self.head_dim)
-
-        # Transform to emb_dim and skip connection
-        act = self.proj(act) # (B, T,C)
-        act = self.proj_dropout(act)
-        act = x + act
-
-        # Think and skip connections
-        ln_act = self.ln2(act)
-        out = self.ffn(ln_act) # (B,T,C)
-        out = self.think_dropout(out)
-        out = x + out # x shape (B,T,C)
-
-        return out
-
-
-class NanoGPT(nn.Module):
-    def __init__(self, vocab_size, block_size, emb_dim, n_layers, n_heads, head_dim, dropout, device):
-        super().__init__()
-
-        # helper variables
-        self.block_size = block_size
-        self.device = device
-
-        # Embedding lookup table
-        self.token_embbeding_table = nn.Embedding(vocab_size, emb_dim)
-        self.position_embedding_table = nn.Embedding(block_size, emb_dim)
-        self.drop = nn.Dropout(dropout)
-
-        # MHA head
-        self.MHA = nn.Sequential(*[MHA(emb_dim, block_size, n_heads, head_dim, dropout) for _ in range(n_layers)])
-
-        # Layernorm
-        self.ln = nn.LayerNorm(emb_dim)
-
-        # final linear layer
-        self.lm_layer = nn.Linear(emb_dim, vocab_size)
-
-        # init weights
-        self.apply(self._init_weights)
-
-        print(f"Number of parameters: {sum([p.numel() for p in self.parameters()])}")
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-
-    def forward(self, x, targets=None):
-        # x shape (B, T)
-        B, T = x.shape
-
-        token_emb = self.token_embbeding_table(x)
-        pos_emb = self.position_embedding_table(torch.arange(0, T).to(self.device))
-        emb = self.drop(token_emb + pos_emb)
-
-        emb = self.MHA(emb)
-        emb = self.ln(emb)
-        logits = self.lm_layer(emb) # (B, T, V)
-
-        loss = None
-
-        if targets is not None:
-            B, T, V = logits.shape
-            loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
-
-        return logits, loss
-
-    def generate(self, tokenizer_model="gpt-2", max_tokens=1000):
-        with torch.no_grad():
-            cur_window, idx_list = torch.LongTensor([[0]]).to(self.device), [0] # (1, 1)
-
-            for i in range(max_tokens):
-                cur_window = cur_window[:, -self.block_size:] # (1, B)
-                logits, _ = self.forward(cur_window) # (1,B,V)
-                probs = torch.softmax(logits, dim=-1).squeeze(dim=0) # (B,V)
-                idx = torch.multinomial(probs, num_samples=1, replacement=True)[-1].item()
-                cur_window = torch.concat([cur_window, torch.LongTensor([[idx]]).view(1, 1).to(self.device)], dim=-1)
-                idx_list.append(idx)
-
-            tokenizer = tiktoken.encoding_for_model(tokenizer_model)
-            generated_text = tokenizer.decode(idx_list)
-
-            return generated_text
-
 # lr scheduler with cosine decay copied from here: https://github.com/karpathy/nanoGPT/blob/93a43d9a5c22450bbf06e78da2cb6eeef084b717/train.py#L230
 def get_lr_multiplier(it):
     # 1) linear warmup for warmup_iters steps
@@ -305,6 +112,13 @@ wandb.init(
 def main():
     torch.random.manual_seed(1337)
 
+    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+    sorted_config = sorted(CONFIG.items())
+    out_dir = "-".join(str(key) + "_" + str(value) for key, value in sorted_config if isinstance(value, (int, float)))
+    out_dir = os.path.join(CONFIG["checkpoint_dir"], out_dir)
+    CONFIG["out_dir"] = out_dir
+    os.makedirs(CONFIG["out_dir"], exist_ok=True)
+
     # data
     CONFIG["data_path"] = "../data/tiny-shakespeare/input.txt"
     train_tokens, val_tokens = call_with_matching_args(get_data, CONFIG)
@@ -318,7 +132,10 @@ def main():
     model = model.to(CONFIG["device"])
 
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
-    scheduler = LambdaLR(optimizer, lr_lambda=get_lr_multiplier)
+    if not CONFIG["fixed_lr"]:
+        scheduler = LambdaLR(optimizer, lr_lambda=get_lr_multiplier)
+    else:
+        scheduler = None
 
     CONFIG["model"] = model
     CONFIG["optimizer"] = optimizer
@@ -326,11 +143,6 @@ def main():
     CONFIG["eval_interval"] = CONFIG["n_iters"] // 10
 
     # train
-    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
-    out_dir = "-".join(str(key) + "_" + str(value) for key, value in CONFIG.items() if isinstance(value, (int, float)))
-    out_dir = os.path.join(CONFIG["checkpoint_dir"], out_dir)
-    CONFIG["out_dir"] = out_dir
-    os.makedirs(CONFIG["out_dir"], exist_ok=True)
     call_with_matching_args(train, CONFIG)
 
 if __name__=="__main__":
