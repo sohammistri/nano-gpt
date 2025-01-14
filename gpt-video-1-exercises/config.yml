@@ -1,16 +1,16 @@
-batch_size: 128
-block_size: 256
-emb_dim: 384
-n_heads: 6
-head_dim: 64
-n_layers: 6
-dropout: 0.2
-fixed_lr: false
+batch_size: 64
+block_size: 8
+emb_dim: 32
+n_heads: 4
+head_dim: 8
+n_layers: 1
+dropout: 0.0
+fixed_lr: true
 n_iters: 4000
 warmup_iters: 200
 lr_decay_iters: 4000
-learning_rate: 5.0e-5  # max lr
-min_lr: 5.0e-6  # min lr
+learning_rate: 3.0e-4  # max lr
+min_lr: 3.0e-5  # min lr
 tokenizer_model: "gpt-2"
 split_ratio: 0.8
 checkpoint_dir: "./checkpoint/"

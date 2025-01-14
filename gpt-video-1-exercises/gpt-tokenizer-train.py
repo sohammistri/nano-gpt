@@ -9,8 +9,8 @@ import tiktoken
 import wandb
 import math
 import os
-from .model import NanoGPT
-from .utils import load_config, call_with_matching_args, get_batch, compute_loss
+from model import NanoGPT
+from utils import load_config, call_with_matching_args, get_batch, compute_loss
 
 # ==== CONFIG ====
 CONFIG = load_config(config_path="config.yml")
@@ -57,15 +57,16 @@ def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_s
         # scheduler step
         if scheduler:
             scheduler.step()
-
-        wandb.log({"learning_rate": scheduler.get_last_lr()[0]})
+            wandb.log({"learning_rate": scheduler.get_last_lr()[0]})
+        else:
+            wandb.log({"learning_rate": optimizer.param_groups[0]['lr']})
 
         if (i % eval_interval == 0) or (i == n_iters - 1):
             model.eval()
             train_loss = compute_loss(train_tokens, block_size, batch_size, model, device)
             val_loss = compute_loss(val_tokens, block_size, batch_size, model, device)
 
-            print(f"Step {i:4d} | Learning Rate: {scheduler.get_last_lr()[0]:.6f} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            print(f"Step {i:4d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
             if val_loss < best_val_loss or always_save_checkpoint:
                 best_val_loss = val_loss
@@ -104,7 +105,7 @@ def get_lr_multiplier(it):
 # Wandb init
 wandb.init(
     # set the wandb project where this run will be logged
-    project="nano-gpt-token-tiny-shakespeare-large",
+    project="nano-gpt-token-small",
     # track hyperparameters and run metadata
     config=CONFIG
 )
