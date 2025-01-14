@@ -120,14 +120,27 @@ def main():
 
     # model init
     model = call_with_matching_args(NanoGPT, CONFIG)
-    model = model.to(CONFIG["device"])
+
+    if CONFIG["continue_train"]:
+        assert "continue_ckpt" in CONFIG
+        checkpoint = torch.load(CONFIG["continue_ckpt"])
+    else:
+        checkpoint = None
 
     # optim and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
+
+    if checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
     if not CONFIG["fixed_lr"]:
         scheduler = LambdaLR(optimizer, lr_lambda=get_lr_multiplier)
+        if checkpoint and checkpoint['scheduler_state_dict']:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     else:
         scheduler = None
+
 
     CONFIG["model"] = model
     CONFIG["optimizer"] = optimizer
@@ -143,6 +156,7 @@ def main():
     )
 
     # train
+    model = model.to(CONFIG["device"])
     call_with_matching_args(train, CONFIG)
 
 if __name__=="__main__":

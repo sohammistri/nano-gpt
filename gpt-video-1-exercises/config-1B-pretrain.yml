@@ -10,8 +10,8 @@ fixed_lr: true
 n_iters: 10000
 warmup_iters: 200
 lr_decay_iters: 10000
-learning_rate: 5.0e-4  # max lr
-min_lr: 5.0e-5  # min lr
+learning_rate: 3.0e-4  # max lr
+min_lr: 3.0e-5  # min lr
 tokenizer_model: "gpt-2"
 split_ratio: 0.8
 checkpoint_dir: "./checkpoint-1B-pretrain/"
@@ -19,3 +19,5 @@ always_save_checkpoint: false
 dataset: "1B_word_LM"
 train_on_full: false
 data_path: "../1-billion-word-language-modeling-benchmark-r13output"
+continue_train: false
+continue_ckpt: "best-1B-pretrain-ckpt-1.pt"

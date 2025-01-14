@@ -19,3 +19,4 @@ always_save_checkpoint: false
 dataset: "tiny_shakespeare"
 train_on_full: false
 data_path: "../data/tiny-shakespeare/input.txt"
+continue_train: false
