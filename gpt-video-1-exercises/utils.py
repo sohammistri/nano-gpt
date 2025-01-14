@@ -6,8 +6,7 @@ import inspect
 def load_config(config_path):
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
-    # Handle device separately
-    config['device'] = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    
     return config
 
 def call_with_matching_args(func: Callable, data_dict: dict) -> Any:

@@ -10,6 +10,8 @@ import wandb
 import math
 import os
 from model import NanoGPT
+import pickle
+import argparse
 from utils import load_config, call_with_matching_args, get_batch, compute_loss
 
 # ==== CONFIG ====
@@ -18,20 +20,35 @@ CONFIG = load_config(config_path="config.yml")
 # Helper functions
 
 def get_data(data_path, tokenizer_model="gpt-2", split_ratio=0.8):
-    # get the raw tiny shakespeare dataset and split into train and val sets
-    with open(data_path) as file:
-        data = file.read()
-
     tokenizer = tiktoken.encoding_for_model(tokenizer_model)
     # Set the vocab size in config
     CONFIG["vocab_size"] = tokenizer.n_vocab
-    tokens = tokenizer.encode(data)
+    if CONFIG["dataset"] == "tiny_shakespeare":
+        # get the raw tiny shakespeare dataset and split into train and val sets
+        with open(data_path) as file:
+            data = file.read()
 
-    split_idx = int(split_ratio * len(tokens))
-    train_tokens = tokens[:split_idx]
-    val_tokens = tokens[split_idx:]
+        tokens = tokenizer.encode(data)
 
-    return train_tokens, val_tokens
+        split_idx = int(split_ratio * len(tokens))
+        train_tokens = tokens[:split_idx]
+        val_tokens = tokens[split_idx:]
+
+        return train_tokens, val_tokens
+    elif CONFIG["dataset"] == "1B_word_LM":
+        # data_path is folder for this
+        with open(os.path.join(data_path, 'train.pkl'), 'rb') as file:
+            train_tokens = pickle.load(file)
+        with open(os.path.join(data_path, 'val.pkl'), 'rb') as file:
+            val_tokens = pickle.load(file)
+        with open(os.path.join(data_path, 'test.pkl'), 'rb') as file:
+            test_tokens = pickle.load(file)
+
+        if CONFIG["train_on_full"]:
+            train_tokens = train_tokens.extend(val_tokens)
+            val_tokens = list(test_tokens)
+
+        return train_tokens, val_tokens
 
 def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_size, batch_size, n_iters, eval_interval, out_dir, always_save_checkpoint):
     # train_lossi, val_lossi = [], []
@@ -105,13 +122,19 @@ def get_lr_multiplier(it):
 # Wandb init
 wandb.init(
     # set the wandb project where this run will be logged
-    project="nano-gpt-token-small",
+    project="nano-gpt-token-1B-pretrain-large",
     # track hyperparameters and run metadata
     config=CONFIG
 )
 
 def main():
     torch.random.manual_seed(1337)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', type=int, default=0, help="GPU ID to use")
+    args = parser.parse_args()
+
+    CONFIG['device'] = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
     os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
     sorted_config = sorted(CONFIG.items())
@@ -121,7 +144,7 @@ def main():
     os.makedirs(CONFIG["out_dir"], exist_ok=True)
 
     # data
-    CONFIG["data_path"] = "../data/tiny-shakespeare/input.txt"
+    # CONFIG["data_path"] = "../data/tiny-shakespeare/input.txt"
     train_tokens, val_tokens = call_with_matching_args(get_data, CONFIG)
     CONFIG["train_tokens"] = train_tokens
     CONFIG["val_tokens"] = val_tokens
