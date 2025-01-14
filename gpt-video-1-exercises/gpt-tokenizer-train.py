@@ -10,46 +10,21 @@ import wandb
 import math
 import os
 from model import NanoGPT
-import pickle
 import argparse
-from utils import load_config, call_with_matching_args, get_batch, compute_loss
+from utils import load_config, call_with_matching_args, get_batch, compute_loss, get_data
+
+# ==== ARGS ====
+parser = argparse.ArgumentParser()
+parser.add_argument('--gpu', type=int, default=0, help="GPU ID to use")
+parser.add_argument('--config_file', type=str, required=True, help="Config file for training")
+
+args = parser.parse_args()
 
 # ==== CONFIG ====
-CONFIG = load_config(config_path="config.yml")
+CONFIG = load_config(config_path=args.config_file)
+OG_CONFIG = dict(CONFIG)
 
-# Helper functions
-
-def get_data(data_path, tokenizer_model="gpt-2", split_ratio=0.8):
-    tokenizer = tiktoken.encoding_for_model(tokenizer_model)
-    # Set the vocab size in config
-    CONFIG["vocab_size"] = tokenizer.n_vocab
-    if CONFIG["dataset"] == "tiny_shakespeare":
-        # get the raw tiny shakespeare dataset and split into train and val sets
-        with open(data_path) as file:
-            data = file.read()
-
-        tokens = tokenizer.encode(data)
-
-        split_idx = int(split_ratio * len(tokens))
-        train_tokens = tokens[:split_idx]
-        val_tokens = tokens[split_idx:]
-
-        return train_tokens, val_tokens
-    elif CONFIG["dataset"] == "1B_word_LM":
-        # data_path is folder for this
-        with open(os.path.join(data_path, 'train.pkl'), 'rb') as file:
-            train_tokens = pickle.load(file)
-        with open(os.path.join(data_path, 'val.pkl'), 'rb') as file:
-            val_tokens = pickle.load(file)
-        with open(os.path.join(data_path, 'test.pkl'), 'rb') as file:
-            test_tokens = pickle.load(file)
-
-        if CONFIG["train_on_full"]:
-            train_tokens = train_tokens.extend(val_tokens)
-            val_tokens = list(test_tokens)
-
-        return train_tokens, val_tokens
-
+# ==== Helper functions ====
 def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_size, batch_size, n_iters, eval_interval, out_dir, always_save_checkpoint):
     # train_lossi, val_lossi = [], []
     best_val_loss = float("inf")
@@ -94,7 +69,7 @@ def train(train_tokens, val_tokens, model, optimizer, scheduler, device, block_s
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                         'loss': val_loss,
-                        'config': CONFIG  # Save configuration as well
+                        'config': OG_CONFIG  # Save configuration as well
                     }
                     print(f"saving checkpoint to {out_dir}")
                     torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -119,42 +94,35 @@ def get_lr_multiplier(it):
     return (CONFIG["min_lr"] + coeff * (CONFIG["learning_rate"] - CONFIG["min_lr"])) / CONFIG["learning_rate"]
 
 
-# Wandb init
-wandb.init(
-    # set the wandb project where this run will be logged
-    project="nano-gpt-token-1B-pretrain-large",
-    # track hyperparameters and run metadata
-    config=CONFIG
-)
-
 def main():
     torch.random.manual_seed(1337)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', type=int, default=0, help="GPU ID to use")
-    args = parser.parse_args()
-
+    # set device
     CONFIG['device'] = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
+    # create the directory of the checkpoints
     os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
     sorted_config = sorted(CONFIG.items())
-    out_dir = "-".join(str(key) + "_" + str(value) for key, value in sorted_config if isinstance(value, (int, float)))
+    out_dir = "-".join(str(value) for _, value in sorted_config if isinstance(value, (int, float)))
     out_dir = os.path.join(CONFIG["checkpoint_dir"], out_dir)
     CONFIG["out_dir"] = out_dir
     os.makedirs(CONFIG["out_dir"], exist_ok=True)
 
-    # data
-    # CONFIG["data_path"] = "../data/tiny-shakespeare/input.txt"
+    # create the dataset
+    tokenizer = tiktoken.encoding_for_model(CONFIG["tokenizer_model"])
+    CONFIG["vocab_size"] = tokenizer.n_vocab
+    CONFIG["tokenizer"] = tokenizer
     train_tokens, val_tokens = call_with_matching_args(get_data, CONFIG)
     CONFIG["train_tokens"] = train_tokens
     CONFIG["val_tokens"] = val_tokens
 
     print(f"Train size: {len(train_tokens)}, Val Size: {len(val_tokens)}")
 
-    # model specific params
+    # model init
     model = call_with_matching_args(NanoGPT, CONFIG)
     model = model.to(CONFIG["device"])
 
+    # optim and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
     if not CONFIG["fixed_lr"]:
         scheduler = LambdaLR(optimizer, lr_lambda=get_lr_multiplier)
@@ -165,6 +133,14 @@ def main():
     CONFIG["optimizer"] = optimizer
     CONFIG["scheduler"] = scheduler
     CONFIG["eval_interval"] = CONFIG["n_iters"] // 10
+
+    # Wandb init
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project=CONFIG["wandb_project"],
+        # track hyperparameters and run metadata
+        config=OG_CONFIG
+    )
 
     # train
     call_with_matching_args(train, CONFIG)

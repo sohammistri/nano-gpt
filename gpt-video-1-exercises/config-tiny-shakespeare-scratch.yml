@@ -1,0 +1,21 @@
+wandb_project: "nano-gpt-token-tiny-shakespeare-large"
+batch_size: 128
+block_size: 256
+emb_dim: 384
+n_heads: 6
+head_dim: 64
+n_layers: 6
+dropout: 0.2
+fixed_lr: false
+n_iters: 4000
+warmup_iters: 200
+lr_decay_iters: 4000
+learning_rate: 5.0e-5  # max lr
+min_lr: 5.0e-6  # min lr
+tokenizer_model: "gpt-2"
+split_ratio: 0.8
+checkpoint_dir: "./checkpoint-tiny-shakespeare-scratch/"
+always_save_checkpoint: false
+dataset: "tiny_shakespeare"
+train_on_full: false
+data_path: "../data/tiny-shakespeare/input.txt"

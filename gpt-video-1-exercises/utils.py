@@ -2,12 +2,43 @@ import yaml
 import torch
 from typing import Any, Callable
 import inspect
+import pickle
+import os
 
 def load_config(config_path):
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
     
     return config
+
+def get_data(dataset, data_path, tokenizer, split_ratio=0.8, train_on_full=False):
+    if dataset == "tiny_shakespeare":
+        # get the raw tiny shakespeare dataset and split into train and val sets
+        with open(data_path) as file:
+            data = file.read()
+
+        tokens = tokenizer.encode(data)
+
+        split_idx = int(split_ratio * len(tokens))
+        train_tokens = tokens[:split_idx]
+        val_tokens = tokens[split_idx:]
+
+        return train_tokens, val_tokens
+    elif dataset == "1B_word_LM":
+        # data_path is folder for this
+        with open(os.path.join(data_path, 'train.pkl'), 'rb') as file:
+            train_tokens = pickle.load(file)
+        with open(os.path.join(data_path, 'val.pkl'), 'rb') as file:
+            val_tokens = pickle.load(file)
+        with open(os.path.join(data_path, 'test.pkl'), 'rb') as file:
+            test_tokens = pickle.load(file)
+
+        if train_on_full:
+            train_tokens = train_tokens.extend(val_tokens)
+            val_tokens = list(test_tokens)
+
+        return train_tokens, val_tokens
+
 
 def call_with_matching_args(func: Callable, data_dict: dict) -> Any:
     """
