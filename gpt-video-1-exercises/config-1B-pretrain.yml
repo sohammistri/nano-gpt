@@ -1,5 +1,5 @@
 wandb_project: "nano-gpt-token-1B-pretrain-large"
-batch_size: 1024
+batch_size: 256
 block_size: 256
 emb_dim: 384
 n_heads: 6
@@ -19,5 +19,5 @@ always_save_checkpoint: false
 dataset: "1B_word_LM"
 train_on_full: false
 data_path: "../1-billion-word-language-modeling-benchmark-r13output"
-continue_train: false
+continue_train: true
 continue_ckpt: "best-1B-pretrain-ckpt-1.pt"

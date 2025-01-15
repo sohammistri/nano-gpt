@@ -123,20 +123,28 @@ def main():
 
     if CONFIG["continue_train"]:
         assert "continue_ckpt" in CONFIG
-        checkpoint = torch.load(CONFIG["continue_ckpt"])
+        checkpoint = torch.load(CONFIG["continue_ckpt"], map_location="cpu")
+    elif CONFIG["finetune"]:
+        assert "finetune_ckpt" in CONFIG
+        checkpoint = torch.load(CONFIG["finetune_ckpt"], map_location="cpu")
     else:
         checkpoint = None
+
+    if checkpoint:
+        print("Loaded model from checkpoint")
+        model.load_state_dict(checkpoint['model_state_dict'])
 
     # optim and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"])
 
-    if checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+    if CONFIG["continue_train"] and (checkpoint): # not ft and ckpt ==> continue
+        print("Loaded optimizer from checkpoint")
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     if not CONFIG["fixed_lr"]:
         scheduler = LambdaLR(optimizer, lr_lambda=get_lr_multiplier)
-        if checkpoint and checkpoint['scheduler_state_dict']:
+        if CONFIG["continue_train"] and checkpoint and checkpoint['scheduler_state_dict']:
+            print("Loaded scheduler from checkpoint")
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     else:
         scheduler = None
