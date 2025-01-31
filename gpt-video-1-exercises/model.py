@@ -132,7 +132,7 @@ class NanoGPT(nn.Module):
 
     def generate(self, tokenizer_model="gpt-2", max_tokens=1000):
         with torch.no_grad():
-            cur_window, idx_list = torch.LongTensor([[0]]).to(self.device), [0] # (1, 1)
+            cur_window, idx_list = torch.LongTensor([[198]]).to(self.device), [198] # "\n" gpt-2 key=198  (1, 1)
 
             for i in range(max_tokens):
                 cur_window = cur_window[:, -self.block_size:] # (1, B)
