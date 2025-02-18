@@ -4,8 +4,12 @@ import torch.optim as optim
 import torch.nn.functional as F
 from dataclasses import dataclass
 import tiktoken
+import os
+import time
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+tokenizer = tiktoken.encoding_for_model("gpt2")
 
 @dataclass
 class GPTConfig:
@@ -197,6 +201,49 @@ class GPT(nn.Module):
 
         return model, config
     
+class DataloaderLite:
+    def __init__(self, B, T, dataset="tiny_shakespeare", dir=None):
+        self.B = B
+        self.T = T
+        self.dataset = dataset
+
+        if self.dataset == "tiny_shakespeare":
+            assert dir is not None
+            with open(os.path.join(dir, "input.txt"), "r") as file:
+                self.txt = file.read()
+            self.tokens = tokenizer.encode(self.txt)
+            self.tokens = torch.tensor(self.tokens).long()
+
+        self.cur_idx = 0
+
+    def sample(self):
+        sampled_tokens = self.tokens[self.cur_idx:self.cur_idx + self.B * self.T + 1]
+        x = sampled_tokens[:-1].view(self.B, self.T)
+        y = sampled_tokens[1:].view(self.B, self.T)
+
+        self.cur_idx += self.B * self.T
+        # reset if overflow
+        if self.cur_idx + self.B * self.T + 1 > self.tokens.shape[0]:
+            self.cur_idx = 0
+
+        return x, y
+    
+def train(model, dataloader, n_iters, optimizer):
+    model.train()
+
+    for i in range(n_iters):
+        t0 = time.time()
+        optimizer.zero_grad(set_to_none=True)
+        x, y = dataloader.sample()
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        t1 = time.time()
+
+        tokens_processed = x.numel()
+        tokens_processed_per_sec = tokens_processed / (t1 - t0)
+        print(f"Iteration: {i:3d} | Train Loss: {loss.item():.4f} | Time per iter: {t1 - t0:.4f} | Tokens Processed per sec: {tokens_processed_per_sec:.4f} toks/sec")
 
 def main():
     torch.manual_seed(42)
@@ -205,26 +252,53 @@ def main():
     elif device == "cuda":
         torch.cuda.manual_seed(42)
 
-    print("Starting loading gpt2....")
-    print(f"Device: {device}")
-    model, config = GPT.from_pretrained(model_type="gpt2")
+    config = GPTConfig()
+
+    B = 4
+    T = 256
+
+    dataloader = DataloaderLite(B=B, T=T, dir="../data/tiny-shakespeare/")
+    model = GPT(config)
     model.to(device)
-    model.eval()
-    print("Didn't crash yay!!")
+    n_iters = 50
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
 
-    print("-" * 50)
+    train(model, dataloader, n_iters=n_iters, optimizer=optimizer)
 
-    print("Lets sample some tokens:")
-    txt = "Hello, I'm a language model,"
-    tokenizer = tiktoken.encoding_for_model("gpt2")
-    tokens = tokenizer.encode(txt)
-    tokens = torch.tensor(tokens).long()
-    print(f"Input seq: {txt}")
-    out_tokens = model.generate(tokens, max_length=30, num_return_sequences=5)
-    out_tokens = out_tokens.cpu().detach().numpy()
-    out_sentences = tokenizer.decode_batch(out_tokens)
-    for sentence in out_sentences:
-        print(sentence)
+
+    # crush a single batch
+    # x, y = dataloader.sample()
+    # x, y = x.to(device), y.to(device)
+
+    # print(f"Training on device {device}")
+
+    # for i in range(n_iters):
+    #     optimizer.zero_grad(set_to_none=True)
+    #     logits, loss = model(x, y)
+    #     loss.backward()
+    #     optimizer.step()
+    #     print(f"Iteration: {i}|Train Loss: {loss.item()}")
+
+    
+    # print("Starting loading gpt2....")
+    # print(f"Device: {device}")
+    # model, config = GPT.from_pretrained(model_type="gpt2")
+    # model.to(device)
+    # model.eval()
+    # print("Didn't crash yay!!")
+
+    # print("-" * 50)
+
+    # print("Lets sample some tokens:")
+    # txt = "Hello, I'm a language model,"
+    # tokens = tokenizer.encode(txt)
+    # tokens = torch.tensor(tokens).long()
+    # print(f"Input seq: {txt}")
+    # out_tokens = model.generate(tokens, max_length=30, num_return_sequences=5)
+    # out_tokens = out_tokens.cpu().detach().numpy()
+    # out_sentences = tokenizer.decode_batch(out_tokens)
+    # for sentence in out_sentences:
+    #     print(sentence)
 
 if __name__ == "__main__":
     main()
