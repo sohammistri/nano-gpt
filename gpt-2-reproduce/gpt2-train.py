@@ -30,6 +30,9 @@ class CausalSelfAttention(nn.Module):
         # NOT NEEDED after FlashAttention
         # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).\
         #                      view(1, 1, config.block_size, config.block_size))
+        # NOT NEEDED after FlashAttention
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).\
+        #                      view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.shape
@@ -39,8 +42,17 @@ class CausalSelfAttention(nn.Module):
 
         q = q.view(B, T, self.config.n_heads, C//self.config.n_heads).transpose(1, 2) # (B, nh, T, ch)
         k = k.view(B, T, self.config.n_heads, C//self.config.n_heads).transpose(1, 2)
+        q = q.view(B, T, self.config.n_heads, C//self.config.n_heads).transpose(1, 2) # (B, nh, T, ch)
+        k = k.view(B, T, self.config.n_heads, C//self.config.n_heads).transpose(1, 2)
         v = v.view(B, T, self.config.n_heads, C//self.config.n_heads).transpose(1, 2)
 
+        # Flash attention
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # attn_scores = q @ k.transpose(-2, -1) * ((k.shape[-1])**-0.5) # (B, nh, T, T)
+        # attn_scores = attn_scores.masked_fill(self.bias[:, :, :T, :T] == 0, -float("inf")) # (B, nh, T, T)
+        # attn_scores = torch.softmax(attn_scores, dim=-1)
+        # out = attn_scores @ v # (B, nh, T, ch)
         # Flash attention
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -154,6 +166,7 @@ class GPT(nn.Module):
             tokens = torch.cat((tokens, sampled_indices), dim=1)
 
         return tokens
+    
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -274,9 +287,26 @@ def cosine_scheduler(it, min_lr, max_lr, warmup_steps, max_steps, base_lr):
     return lr / base_lr
 
 def train(model, dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
+
+def cosine_scheduler(it, min_lr, max_lr, warmup_steps, max_steps, base_lr):
+    if it < warmup_steps:
+        lr = max_lr * ((it + 1) / warmup_steps)
+    elif it > max_steps:
+        lr = min_lr
+    else:
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1 + math.cos(decay_ratio * math.pi)) # starts with 1, ends at 0
+        lr = min_lr + coeff * (max_lr - min_lr)
+
+    return lr / base_lr
+
+def train(model, dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
     model.train()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) # prevent underflow of grads in mixed precision training
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) # prevent underflow of grads in mixed precision training
 
+    for iter in range(n_iters):
     for iter in range(n_iters):
         t0 = time.time()
 
@@ -304,6 +334,8 @@ def train(model, dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
         optimizer.zero_grad(set_to_none=True)
         if device == "cuda":
             torch.cuda.synchronize() # wait for the GPU to finish work
+        if device == "cuda":
+            torch.cuda.synchronize() # wait for the GPU to finish work
         t1 = time.time()
 
         tokens_processed = x.numel() * grad_accum_steps * ddp_world_size
@@ -328,6 +360,7 @@ def main():
 
     dataloader = DataloaderLite(B=B, T=T, dir="../data/tiny-shakespeare/", rank=ddp_rank, world_size=ddp_world_size)
     model = GPT(config)
+    model = torch.compile(model)
     model.to(device)
     model = torch.compile(model)
     if ddp:
