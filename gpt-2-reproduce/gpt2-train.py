@@ -11,11 +11,11 @@ import math
 import inspect
 import numpy as np
 import wandb
-
+from hellaswag import render_example, iterate_examples
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024 # max sequence length
+    block_size: int = 2048 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layers: int = 24 # number of layers
     n_heads: int = 16 # number of heads
@@ -236,7 +236,7 @@ class GPT(nn.Module):
 def load_shard(shard_path):
     # Load the uint16 numpy array from the .npy file
     np_array = np.load(shard_path)
-
+    np_array = np_array.astype(np.int32) # added after video
     # Convert numpy array to float PyTorch tensor
     torch_tensor = torch.from_numpy(np_array).long()
 
@@ -314,14 +314,37 @@ def cosine_scheduler(it, min_lr, max_lr, warmup_steps, max_steps, base_lr):
 
     return lr / base_lr
 
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
 def train(model, train_dataloader, val_dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) # prevent underflow of grads in mixed precision training
 
     for iter in range(n_iters):
         t0 = time.time()
 
-        # Compute val loss
-        if (iter % 100 == 0) or (iter == n_iters - 1):
+
+        if (iter % 250 == 0) or (iter == n_iters - 1):
+            # Compute val loss
             model.eval()
             val_dataloader.reset()
             with torch.no_grad():
@@ -342,19 +365,63 @@ def train(model, train_dataloader, val_dataloader, n_iters, grad_accum_steps, op
                     wandb.log({"Validation loss": val_loss_accum.item()})
                     # print(f"Val Loss: {val_loss_accum.item():.4f}")
 
-                if master_process:
-                    print("Lets sample some tokens:")
-                    txt = "Hello, I'm a language model,"
-                    tokens = tokenizer.encode(txt)
-                    tokens = torch.tensor(tokens).long()
-                    print(f"Input seq: {txt}")
-                    out_tokens = model.module.generate(tokens, max_length=30, num_return_sequences=5)
-                    out_tokens = out_tokens.cpu().detach().numpy()
-                    out_sentences = tokenizer.decode_batch(out_tokens)
-                    
-                    for sentence in out_sentences:
-                        print(sentence)
-                    print("-" * 100)
+            #evaluate hellaswag
+            num_correct_norm = 0
+            num_total = 0
+            for i, example in enumerate(iterate_examples("val")):
+                # only process examples where i % ddp_world_size == ddp_rank
+                if i % ddp_world_size != ddp_rank:
+                    continue
+                # render the example into tokens and labels
+                _, tokens, mask, label = render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                # get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(tokens)
+                    pred_norm = get_most_likely_row(tokens, mask, logits)
+                num_total += 1
+                num_correct_norm += int(pred_norm == label)
+            # reduce the stats across all processes
+            if ddp:
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                num_total = num_total.item()
+                num_correct_norm = num_correct_norm.item()
+            acc_norm = num_correct_norm / num_total
+            if master_process:
+                wandb.log({"HellaSwag accuracy": acc_norm})
+
+            if master_process:
+                txt = "Hello, I'm a language model,"
+                tokens = tokenizer.encode(txt)
+                tokens = torch.tensor(tokens).long()
+                out_tokens = model.module.generate(tokens, max_length=30, num_return_sequences=5)
+                out_tokens = out_tokens.cpu().detach().numpy()
+                out_sentences = tokenizer.decode_batch(out_tokens)
+                
+                table = wandb.Table(columns=["samples"])
+                for sentence in out_sentences:
+                    table.add_data(sentence)
+                wandb.log({"text_samples": table})
+
+        # save ckpts
+        if iter > 0 and (iter % 500 == 0 or iter == n_iters - 1):
+                # optionally write model checkpoints
+                os.makedirs("checkpoints-gpt3-large", exist_ok=True)
+                checkpoint_path = os.path.join("checkpoints-gpt3-large", f"model_{iter:05d}.pt")
+                checkpoint = {
+                    'model': model.module.state_dict(),
+                    'config': model.module.config,
+                    'step': iter,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
 
         model.train()
         loss_accum = 0.0
@@ -388,15 +455,12 @@ def train(model, train_dataloader, val_dataloader, n_iters, grad_accum_steps, op
 
         if master_process:
             wandb.log({"Train Loss": loss_accum.item(), "lr": scheduler.get_last_lr()[0], "Grad norm": norm})
-            # print(f"Iteration: {iter:3d} | Train Loss: {loss_accum.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4e} | Grad norm: {norm:.4f} | Time per iter: {(t1 - t0)*1000:.2f} ms | Tokens Processed per sec: {int(tokens_processed_per_sec)} toks/sec")
-
-        
 
 def main():
     config = GPTConfig(vocab_size=50304)
 
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-    B = 16
+    B = 8
     T = config.block_size
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
@@ -416,12 +480,15 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    n_iters = 500
-    base_lr = 2e-4
-    max_lr = 2e-4
+    n_iters = 19074
+    # n_iters = 500
+    base_lr = 0.00025
+    max_lr = 0.00025
     min_lr = max_lr * 0.10
-    warmup_steps = 100
-    max_steps = 500
+    warmup_steps = 715
+    max_steps = 19074
+    # warmup_steps = 100
+    # max_steps = 500
     
     optimizer = raw_model.configure_optimizers(weight_decay=0.10, learning_rate=base_lr, device=device)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: cosine_scheduler(epoch, min_lr, max_lr, warmup_steps, max_steps, base_lr))

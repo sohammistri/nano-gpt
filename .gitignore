@@ -179,3 +179,4 @@ minbpe/models/
 *.tar.gz
 *.pt
 gpt-2-reproduce/edu_fineweb10B/*
+gpt-2-reproduce/hellaswag
