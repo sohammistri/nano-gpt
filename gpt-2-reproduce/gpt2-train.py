@@ -9,16 +9,17 @@ import os
 import time
 import math 
 import inspect
-
+import numpy as np
+import wandb
 
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layers: int = 12 # number of layers
-    n_heads: int = 12 # number of heads
-    n_embed: int = 768 # embedding dimension
+    n_layers: int = 24 # number of layers
+    n_heads: int = 16 # number of heads
+    n_embed: int = 1536 # embedding dimension
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -232,8 +233,17 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
     
+def load_shard(shard_path):
+    # Load the uint16 numpy array from the .npy file
+    np_array = np.load(shard_path)
+
+    # Convert numpy array to float PyTorch tensor
+    torch_tensor = torch.from_numpy(np_array).long()
+
+    return torch_tensor
+
 class DataloaderLite:
-    def __init__(self, B, T, rank, world_size, dataset="tiny_shakespeare", dir=None):
+    def __init__(self, B, T, rank, world_size, dataset="tiny_shakespeare", dir=None, split=None):
         self.B = B
         self.T = T
         self.dataset = dataset
@@ -246,21 +256,51 @@ class DataloaderLite:
                 self.txt = file.read()
             self.tokens = tokenizer.encode(self.txt)
             self.tokens = torch.tensor(self.tokens).long()
+            self.cur_idx = self.B * self.T * self.rank
+        elif self.dataset == "fineweb_edu":
+            assert dir is not None
+            assert split in {'train', 'val'}
 
-        self.cur_idx = self.B * self.T * self.rank
+            # get list of shards
+            shards = os.listdir(dir)
+            shards = [s for s in shards if split in s]
+            shards = sorted(shards)
+            shards = [os.path.join(dir, s) for s in shards]
+            self.shards = shards
+            assert len(shards) > 0, f"no shards found for split {split}"
+
+            if master_process:
+                print(f"found {len(shards)} shards for split {split}")
+
+            # state, init at shard zero
+            self.current_shard = 0
+            self.tokens = load_shard(self.shards[self.current_shard])
+            self.cur_idx = self.B * self.T * self.rank
+
+    def reset(self):
+        if self.dataset == "fineweb_edu":
+            # state, init at shard zero
+            self.current_shard = 0
+            self.tokens = load_shard(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.rank
 
     def sample(self):
         sampled_tokens = self.tokens[self.cur_idx:self.cur_idx + self.B * self.T + 1]
         x = sampled_tokens[:-1].view(self.B, self.T)
         y = sampled_tokens[1:].view(self.B, self.T)
-
         self.cur_idx += self.B * self.T * self.world_size
+
         # reset if overflow
         if self.cur_idx + self.B * self.T * self.world_size + 1 > self.tokens.shape[0]:
-            self.cur_idx = self.B * self.T * self.rank
+            if self.dataset == "tiny_shakespeare": 
+                    self.cur_idx = self.B * self.T * self.rank
+            elif self.dataset == "fineweb_edu":
+                self.current_shard = (self.current_shard + 1) % len(self.shards) # advance a shard
+                self.tokens = load_shard(self.shards[self.current_shard]) # load a new one
+                self.cur_idx = self.B * self.T * self.rank # restart from offset
 
         return x, y
-
+    
 def cosine_scheduler(it, min_lr, max_lr, warmup_steps, max_steps, base_lr):
     if it < warmup_steps:
         lr = max_lr * ((it + 1) / warmup_steps)
@@ -274,16 +314,52 @@ def cosine_scheduler(it, min_lr, max_lr, warmup_steps, max_steps, base_lr):
 
     return lr / base_lr
 
-def train(model, dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
-    model.train()
+def train(model, train_dataloader, val_dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) # prevent underflow of grads in mixed precision training
 
     for iter in range(n_iters):
         t0 = time.time()
 
+        # Compute val loss
+        if (iter % 100 == 0) or (iter == n_iters - 1):
+            model.eval()
+            val_dataloader.reset()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_steps = 20
+                for micro_step in range(val_steps):
+                    x, y = val_dataloader.sample()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+                        logits, loss = model(x, y)
+                        # print(logits.dtype, loss.dtype) logits: bfloat16, loss: float32
+                    loss /= val_steps
+                    val_loss_accum += loss.detach()
+                if ddp:
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # Collect all losses from all GPUs and make them avg
+
+                if master_process:
+                    wandb.log({"Validation loss": val_loss_accum.item()})
+                    # print(f"Val Loss: {val_loss_accum.item():.4f}")
+
+                if master_process:
+                    print("Lets sample some tokens:")
+                    txt = "Hello, I'm a language model,"
+                    tokens = tokenizer.encode(txt)
+                    tokens = torch.tensor(tokens).long()
+                    print(f"Input seq: {txt}")
+                    out_tokens = model.module.generate(tokens, max_length=30, num_return_sequences=5)
+                    out_tokens = out_tokens.cpu().detach().numpy()
+                    out_sentences = tokenizer.decode_batch(out_tokens)
+                    
+                    for sentence in out_sentences:
+                        print(sentence)
+                    print("-" * 100)
+
+        model.train()
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
-            x, y = dataloader.sample()
+            x, y = train_dataloader.sample()
             x, y = x.to(device), y.to(device)
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
@@ -291,10 +367,10 @@ def train(model, dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
                 logits, loss = model(x, y)
                 # print(logits.dtype, loss.dtype) logits: bfloat16, loss: float32
                 loss /= grad_accum_steps
-                loss_accum += loss.detach()
-                scaler.scale(loss).backward()
-                if ddp:
-                    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # Collect all losses from all GPUs and make them avg
+            loss_accum += loss.detach()
+            scaler.scale(loss).backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # Collect all losses from all GPUs and make them avg
 
         scaler.unscale_(optimizer)
         # Grad scaling
@@ -311,7 +387,10 @@ def train(model, dataloader, n_iters, grad_accum_steps, optimizer, scheduler):
         tokens_processed_per_sec = tokens_processed / (t1 - t0)
 
         if master_process:
-            print(f"Iteration: {iter:3d} | Train Loss: {loss_accum.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4e} | Grad norm: {norm:.4f} | Time per iter: {(t1 - t0)*1000:.2f} ms | Tokens Processed per sec: {int(tokens_processed_per_sec)} toks/sec")
+            wandb.log({"Train Loss": loss_accum.item(), "lr": scheduler.get_last_lr()[0], "Grad norm": norm})
+            # print(f"Iteration: {iter:3d} | Train Loss: {loss_accum.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4e} | Grad norm: {norm:.4f} | Time per iter: {(t1 - t0)*1000:.2f} ms | Tokens Processed per sec: {int(tokens_processed_per_sec)} toks/sec")
+
+        
 
 def main():
     config = GPTConfig(vocab_size=50304)
@@ -327,7 +406,8 @@ def main():
     # FP32 -> TF32 matrix muls
     torch.set_float32_matmul_precision('high')
 
-    dataloader = DataloaderLite(B=B, T=T, dir="../data/tiny-shakespeare/", rank=ddp_rank, world_size=ddp_world_size)
+    train_dataloader = DataloaderLite(B=B, T=T, dataset="fineweb_edu", dir="edu_fineweb10B", rank=ddp_rank, world_size=ddp_world_size, split="train")
+    val_dataloader = DataloaderLite(B=B, T=T, dataset="fineweb_edu", dir="edu_fineweb10B", rank=ddp_rank, world_size=ddp_world_size, split="val")
 
     model = GPT(config)
     model.to(device)
@@ -336,54 +416,22 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    n_iters = 50
-    base_lr = 6e-4
-    max_lr = 6e-4
+    n_iters = 500
+    base_lr = 2e-4
+    max_lr = 2e-4
     min_lr = max_lr * 0.10
-    warmup_steps = 10
-    max_steps = 50
+    warmup_steps = 100
+    max_steps = 500
     
     optimizer = raw_model.configure_optimizers(weight_decay=0.10, learning_rate=base_lr, device=device)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: cosine_scheduler(epoch, min_lr, max_lr, warmup_steps, max_steps, base_lr))
 
     if master_process:
         print(f"Training on device {device}")
-    train(model, dataloader, n_iters=n_iters, grad_accum_steps=grad_accum_steps, optimizer=optimizer, scheduler=scheduler)
+    train(model, train_dataloader, val_dataloader, n_iters=n_iters, grad_accum_steps=grad_accum_steps, optimizer=optimizer, scheduler=scheduler)
 
     if ddp:
         dist.destroy_process_group()
-    # crush a single batch
-    # x, y = dataloader.sample()
-    # x, y = x.to(device), y.to(device)
-
-
-    # for i in range(n_iters):
-    #     optimizer.zero_grad(set_to_none=True)
-    #     logits, loss = model(x, y)
-    #     loss.backward()
-    #     optimizer.step()
-    #     print(f"Iteration: {i}|Train Loss: {loss.item()}")
-
-    
-    # print("Starting loading gpt2....")
-    # print(f"Device: {device}")
-    # model, config = GPT.from_pretrained(model_type="gpt2")
-    # model.to(device)
-    # model.eval()
-    # print("Didn't crash yay!!")
-
-    # print("-" * 50)
-
-    # print("Lets sample some tokens:")
-    # txt = "Hello, I'm a language model,"
-    # tokens = tokenizer.encode(txt)
-    # tokens = torch.tensor(tokens).long()
-    # print(f"Input seq: {txt}")
-    # out_tokens = model.generate(tokens, max_length=30, num_return_sequences=5)
-    # out_tokens = out_tokens.cpu().detach().numpy()
-    # out_sentences = tokenizer.decode_batch(out_tokens)
-    # for sentence in out_sentences:
-    #     print(sentence)
 
 if __name__ == "__main__":
     device = "cpu"
@@ -420,6 +468,13 @@ if __name__ == "__main__":
             torch.mps.manual_seed(42)
         elif device == "cuda":
             torch.cuda.manual_seed(42)
+
+    if master_process:
+          # Wandb init
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="gpt2-fineweb-edu-pretrain",
+        )
 
 
     main()
